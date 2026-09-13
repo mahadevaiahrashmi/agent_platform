@@ -1,107 +1,101 @@
-"""Produce a Pydantic-validated object from an LLM response.
+"""Project 1 — Structured Output Agent.
 
-Prompts contain the source text and JSON schema; JSON parsing and schema
-validation are enforced; each failed attempt logs its number, raw response,
-and error; the next prompt includes the previous error; max_retries + 1 total
-attempts are allowed before ExtractionError.
+Make LLM output reliable: enforce a Pydantic schema, retry on parse/validation
+errors feeding the error back to the model, and log every failure.
 """
 
 from __future__ import annotations
 
 import json
-import logging
-from typing import Any, Type, TypeVar
+from typing import Optional
 
 from pydantic import BaseModel, ValidationError
 
-logger = logging.getLogger(__name__)
-
-T = TypeVar("T", bound=BaseModel)
-
 
 class ExtractionError(Exception):
-    """Raised when structured extraction fails after all retries."""
-
-    def __init__(self, message: str, attempts: int, last_raw: str | None = None):
-        super().__init__(message)
-        self.attempts = attempts
-        self.last_raw = last_raw
+    """Raised when the LLM cannot produce schema-valid output within retries."""
 
 
-def _schema_for_model(model: Type[BaseModel]) -> dict:
-    return model.model_json_schema()
+class StructuredAgent:
+    def __init__(self, llm, schema: type[BaseModel], max_retries: int = 2):
+        """Initialize with an LLM client, a Pydantic model class, and a retry cap.
 
+        Must set up:
+            - self.llm, self.schema, self.max_retries
+            - self.failures: list of dicts logging every failed attempt
+              ({"attempt": int, "raw": str, "error": str})
+        """
+        self.llm = llm
+        self.schema = schema
+        self.max_retries = max_retries
+        self.failures: list[dict] = []
 
-def extract_structured(
-    llm: Any,
-    source_text: str,
-    model: Type[T],
-    max_retries: int = 2,
-) -> T:
-    """Extract a validated Pydantic model from source_text via the LLM.
+    def build_prompt(self, text: str, previous_error: str | None = None) -> str:
+        """Build the extraction prompt.
 
-    The prompt always includes the source text and the JSON schema of `model`.
-    On failure the next prompt includes the previous error.  Exactly
-    ``max_retries + 1`` attempts are made before raising ExtractionError.
-    """
-    schema = _schema_for_model(model)
-    schema_str = json.dumps(schema, indent=2)
-    previous_error: str | None = None
-    last_raw: str | None = None
-    total_attempts = max_retries + 1
-
-    for attempt in range(1, total_attempts + 1):
-        prompt_parts = [
-            "Extract structured data from the following source text.",
-            "Return ONLY valid JSON that matches the schema exactly.",
+        Requirements:
+            - MUST include the schema's JSON structure (use
+              self.schema.model_json_schema()) so the model knows the contract.
+            - MUST include the source text.
+            - When retrying, MUST include the previous validation error verbatim
+              so the model can correct itself. Retries that don't feed the error
+              back are scored as incorrect.
+        """
+        schema_json = json.dumps(self.schema.model_json_schema(), indent=2)
+        parts = [
+            "Extract structured data matching the following JSON schema.",
+            "Return ONLY valid JSON that conforms to the schema.",
+            "",
+            "Schema:",
+            schema_json,
             "",
             "Source text:",
-            source_text,
-            "",
-            "JSON Schema:",
-            schema_str,
+            text,
         ]
         if previous_error is not None:
-            prompt_parts.extend(
+            parts.extend(
                 [
                     "",
-                    f"Previous attempt failed with error: {previous_error}",
-                    "Please correct the output.",
+                    f"Previous error: {previous_error}",
+                    "Please correct the output based on the error above.",
                 ]
             )
-        prompt = "\n".join(prompt_parts)
+        return "\n".join(parts)
 
-        try:
-            raw = llm.complete(prompt)
-            last_raw = raw
-            # Strip markdown fences if present
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                lines = cleaned.splitlines()
-                if lines[0].startswith("```"):
-                    lines = lines[1:]
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                cleaned = "\n".join(lines).strip()
+    def extract(self, text: str) -> BaseModel:
+        """Extract a validated instance of self.schema from text.
 
-            data = json.loads(cleaned)
-            result = model.model_validate(data)
-            return result
-        except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as exc:
-            error_msg = f"{type(exc).__name__}: {exc}"
-            logger.info(
-                "structured_output attempt %s failed: raw=%r error=%s",
-                attempt,
-                last_raw,
-                error_msg,
-            )
-            previous_error = error_msg
-            if attempt == total_attempts:
-                raise ExtractionError(
-                    f"Failed to extract valid {model.__name__} after {total_attempts} attempts",
-                    attempts=total_attempts,
-                    last_raw=last_raw,
-                ) from exc
+        Requirements:
+            - Call the LLM, parse the response as JSON, validate with the schema
+              (schema.model_validate_json or equivalent).
+            - On parse/validation failure: log to self.failures and retry with
+              the error fed back, up to self.max_retries retries
+              (max_retries + 1 total attempts).
+            - After exhausting retries, raise ExtractionError. All failures must
+              remain logged in self.failures.
+        """
+        previous_error: Optional[str] = None
+        total_attempts = self.max_retries + 1
 
-    # Unreachable, but satisfies type checkers
-    raise ExtractionError("Unexpected fall-through", attempts=total_attempts, last_raw=last_raw)
+        for attempt in range(1, total_attempts + 1):
+            prompt = self.build_prompt(text, previous_error)
+            raw = self.llm.complete(prompt)
+            try:
+                # Prefer model_validate_json when available
+                try:
+                    return self.schema.model_validate_json(raw)
+                except Exception:
+                    data = json.loads(raw)
+                    return self.schema.model_validate(data)
+            except (json.JSONDecodeError, ValidationError, ValueError, TypeError) as exc:
+                error_str = f"{type(exc).__name__}: {exc}"
+                self.failures.append(
+                    {"attempt": attempt, "raw": raw, "error": error_str}
+                )
+                previous_error = error_str
+                if attempt == total_attempts:
+                    raise ExtractionError(
+                        f"Failed after {total_attempts} attempts"
+                    ) from exc
+
+        raise ExtractionError("Unexpected fall-through")

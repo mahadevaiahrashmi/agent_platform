@@ -1,120 +1,93 @@
-"""Register tools, resolve capabilities, enforce scopes, and execute batches concurrently.
+"""Project 3 — Multi-Tool Orchestrator.
 
-Re-registering a name replaces it; highest priority wins and alphabetical name
-breaks ties; unknown capabilities raise KeyError; missing scopes raise
-PermissionDenied before execution; parallel tasks use real thread concurrency,
-preserve input order, and isolate failures as {"ok": False, "error": ...}.
+Dynamic tool registry, capability-based routing with priority conflict
+resolution, permission scoping, and parallel execution.
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set
-
-
-class PermissionDenied(Exception):
-    """Raised when a required scope is missing."""
-
-    def __init__(self, tool_name: str, missing_scopes: Set[str]):
-        self.tool_name = tool_name
-        self.missing_scopes = missing_scopes
-        super().__init__(
-            f"Permission denied for tool '{tool_name}': missing scopes {sorted(missing_scopes)}"
-        )
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Set
 
 
 @dataclass
-class ToolSpec:
+class Tool:
     name: str
-    fn: Callable[..., Any]
-    capabilities: Set[str] = field(default_factory=set)
-    scopes: Set[str] = field(default_factory=set)
-    priority: int = 0
+    fn: Callable
+    capabilities: set[str]
+    required_scope: str | None = None  # None = public
+    priority: int = 0  # higher wins when capabilities conflict
 
 
-class ToolOrchestrator:
-    def __init__(self) -> None:
-        self._tools: Dict[str, ToolSpec] = {}
+class PermissionDenied(Exception):
+    pass
 
-    def register(
-        self,
-        name: str,
-        fn: Callable[..., Any],
-        *,
-        capabilities: Optional[Sequence[str]] = None,
-        scopes: Optional[Sequence[str]] = None,
-        priority: int = 0,
-    ) -> None:
-        """Register (or replace) a tool under ``name``."""
-        self._tools[name] = ToolSpec(
-            name=name,
-            fn=fn,
-            capabilities=set(capabilities or []),
-            scopes=set(scopes or []),
-            priority=priority,
-        )
 
-    def resolve(self, capability: str) -> ToolSpec:
-        """Return the highest-priority tool that advertises ``capability``.
+class Orchestrator:
+    def __init__(self):
+        """Set up an empty registry."""
+        self._registry: Dict[str, Tool] = {}
 
-        Ties are broken alphabetically by name.  Raises KeyError if none match.
+    def register(self, tool: Tool) -> None:
+        """Add a tool. Re-registering the same name replaces it."""
+        self._registry[tool.name] = tool
+
+    def resolve(self, capability: str) -> Tool:
+        """Return the tool for a capability.
+
+        Requirements:
+            - If several tools share the capability, the highest `priority`
+              wins; ties break alphabetically by name (deterministic).
+            - Unknown capability -> KeyError.
         """
         candidates = [
-            t for t in self._tools.values() if capability in t.capabilities
+            t for t in self._registry.values() if capability in t.capabilities
         ]
         if not candidates:
-            raise KeyError(f"No tool registered for capability: {capability}")
-        # Highest priority first, then alphabetical name
+            raise KeyError(f"No tool for capability: {capability}")
         candidates.sort(key=lambda t: (-t.priority, t.name))
         return candidates[0]
 
-    def execute(
-        self,
-        name: str,
-        args: Optional[dict] = None,
-        *,
-        granted_scopes: Optional[Sequence[str]] = None,
-    ) -> Any:
-        """Execute a single tool after scope check."""
-        if name not in self._tools:
-            raise KeyError(f"Unknown tool: {name}")
-        tool = self._tools[name]
-        granted = set(granted_scopes or [])
-        missing = tool.scopes - granted
-        if missing:
-            raise PermissionDenied(name, missing)
-        return tool.fn(**(args or {}))
+    def execute(self, capability: str, scopes: set[str], **kwargs):
+        """Resolve and run one tool.
 
-    def execute_batch(
-        self,
-        tasks: Sequence[dict],
-        *,
-        granted_scopes: Optional[Sequence[str]] = None,
-        max_workers: int = 4,
-    ) -> List[dict]:
-        """Execute multiple tool calls concurrently.
+        Requirements:
+            - If the tool has a required_scope not present in `scopes`,
+              raise PermissionDenied WITHOUT executing the tool.
+        """
+        tool = self.resolve(capability)
+        if tool.required_scope is not None and tool.required_scope not in scopes:
+            raise PermissionDenied(
+                f"Tool '{tool.name}' requires scope '{tool.required_scope}'"
+            )
+        return tool.fn(**kwargs)
 
-        Each task is a dict with at least ``name`` and optional ``args``.
-        Results preserve input order.  Failures are isolated as
-        ``{"ok": False, "error": ...}``.
+    def execute_parallel(self, tasks: list[dict], scopes: set[str]) -> list[dict]:
+        """Run many tasks concurrently (threads); each task is
+        {"capability": str, "kwargs": dict}.
+
+        Requirements:
+            - MUST use real concurrency (concurrent.futures) — grading asserts
+              wall-clock time of parallel sleeps.
+            - Results return IN INPUT ORDER as
+              {"ok": True, "result": ...} or {"ok": False, "error": str}.
+            - One failing/forbidden task must not affect the others.
         """
         results: List[Optional[dict]] = [None] * len(tasks)
 
         def _run(idx: int, task: dict) -> None:
-            name = task.get("name") or task.get("tool")
-            args = task.get("args") or task.get("arguments") or {}
+            capability = task.get("capability", "")
+            kwargs = task.get("kwargs") or {}
             try:
-                value = self.execute(name, args, granted_scopes=granted_scopes)
+                value = self.execute(capability, scopes, **kwargs)
                 results[idx] = {"ok": True, "result": value}
             except Exception as exc:
                 results[idx] = {"ok": False, "error": str(exc)}
 
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {
-                pool.submit(_run, i, t): i for i, t in enumerate(tasks)
-            }
-            for fut in as_completed(futures):
-                fut.result()  # surface any unexpected exception from the worker itself
+        with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as pool:
+            futures = [pool.submit(_run, i, t) for i, t in enumerate(tasks)]
+            for f in as_completed(futures):
+                f.result()
 
         return [r if r is not None else {"ok": False, "error": "missing"} for r in results]

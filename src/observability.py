@@ -1,125 +1,116 @@
-"""Trace spans and wrap an LLM with per-call accounting and loop detection.
+"""Project 10 — Production Agent Observability.
 
-Spans use the injected clock, capture parent names, and are appended in finish
-order even when exceptions propagate; each wrapped call runs inside a span
-named llm.complete, increments count and cost even on failure, and alarms at
-every repeated-prompt threshold multiple; reports contain calls, total cost,
-mean completed LLM-span latency, and alerts.
+Instrument an agent with tracing spans, per-call cost/latency accounting,
+and a repeated-prompt loop alarm — the testable core of what LangSmith/Arize
+give you in production.
 """
 
 from __future__ import annotations
 
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 
-@dataclass
-class Span:
-    name: str
-    start: float
-    end: Optional[float] = None
-    parent: Optional[str] = None
-    error: Optional[str] = None
-    attributes: Dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def duration(self) -> Optional[float]:
-        if self.end is None:
-            return None
-        return self.end - self.start
-
-
-@dataclass
-class ObservabilityReport:
-    calls: int
-    total_cost: float
-    mean_llm_latency: float
-    alerts: List[str]
-    spans: List[Span]
-
-
 class Tracer:
-    def __init__(self, clock: Callable[[], float] = time.time):
-        self._clock = clock
-        self.spans: List[Span] = []
-        self._stack: List[Span] = []
+    def __init__(self, clock=None):
+        """clock: injectable time function (tests pass a fake; default
+        time.monotonic). Must set up self.spans: list of finished spans,
+        {"name": str, "duration": float, "parent": str | None}, appended in
+        FINISH order."""
+        self._clock: Callable[[], float] = clock if clock is not None else time.monotonic
+        self.spans: List[dict] = []
+        self._stack: List[str] = []
 
     @contextmanager
-    def span(self, name: str, **attributes: Any):
-        parent_name = self._stack[-1].name if self._stack else None
-        sp = Span(
-            name=name,
-            start=self._clock(),
-            parent=parent_name,
-            attributes=dict(attributes),
-        )
-        self._stack.append(sp)
+    def span(self, name: str):
+        """Context manager measuring a named span.
+
+        Requirements:
+            - duration = clock() at exit - clock() at entry.
+            - Nested spans record their enclosing span's name as parent
+              (top level -> None).
+            - The span is recorded even if the body raises (exception must
+              propagate).
+        """
+        parent = self._stack[-1] if self._stack else None
+        start = self._clock()
+        self._stack.append(name)
         try:
-            yield sp
-        except Exception as exc:
-            sp.error = str(exc)
-            raise
+            yield
         finally:
-            sp.end = self._clock()
+            end = self._clock()
             self._stack.pop()
-            # Append in finish order even when exceptions propagate
-            self.spans.append(sp)
+            self.spans.append(
+                {
+                    "name": name,
+                    "duration": end - start,
+                    "parent": parent,
+                }
+            )
 
 
 class InstrumentedLLM:
-    """Wrap an LLM, recording every complete() call inside an llm.complete span."""
+    """Wrap an LLM client with cost accounting and a loop alarm."""
 
     def __init__(
         self,
-        llm: Any,
+        llm,
         tracer: Tracer,
         cost_per_call: float = 0.01,
         loop_threshold: int = 3,
     ):
+        """Must set up:
+            - self.total_cost, self.call_count
+            - self.alerts: list of {"type": "loop", "prompt": str,
+              "count": int}
+        """
         self.llm = llm
         self.tracer = tracer
         self.cost_per_call = cost_per_call
         self.loop_threshold = loop_threshold
-        self.call_count = 0
         self.total_cost = 0.0
+        self.call_count = 0
+        self.alerts: List[dict] = []
         self._prompt_counts: Dict[str, int] = {}
-        self.alerts: List[str] = []
 
-    def complete(self, prompt: str, **kwargs: Any) -> str:
+    def complete(self, prompt: str) -> str:
+        """Delegate to the wrapped llm inside a tracer span named "llm.complete".
+
+        Requirements:
+            - Add cost_per_call to total_cost per call (also on failures).
+            - Loop alarm: when the SAME prompt string is seen for the
+              loop_threshold-th time, append one alert (once per threshold
+              multiple: at 3, 6, 9... for threshold 3).
+        """
         self.call_count += 1
         self.total_cost += self.cost_per_call
 
-        # Loop detection
-        key = prompt.strip()
-        self._prompt_counts[key] = self._prompt_counts.get(key, 0) + 1
-        count = self._prompt_counts[key]
+        count = self._prompt_counts.get(prompt, 0) + 1
+        self._prompt_counts[prompt] = count
         if count >= self.loop_threshold and count % self.loop_threshold == 0:
-            alert = f"repeated_prompt_threshold:{count}"
-            self.alerts.append(alert)
+            self.alerts.append(
+                {"type": "loop", "prompt": prompt, "count": count}
+            )
 
-        with self.tracer.span("llm.complete", prompt_len=len(prompt)):
-            try:
-                return self.llm.complete(prompt, **kwargs)
-            except Exception:
-                # cost and count already incremented
-                raise
+        with self.tracer.span("llm.complete"):
+            return self.llm.complete(prompt)
 
-    def report(self) -> ObservabilityReport:
+    def report(self) -> dict:
+        """{"calls": int, "total_cost": float, "avg_latency": float
+        (mean duration of llm.complete spans, 0.0 when none),
+        "alerts": <the alerts list>}."""
         llm_spans = [
-            s for s in self.tracer.spans
-            if s.name == "llm.complete" and s.duration is not None
+            s for s in self.tracer.spans if s["name"] == "llm.complete"
         ]
-        mean_lat = (
-            sum(s.duration for s in llm_spans) / len(llm_spans)
+        avg = (
+            sum(s["duration"] for s in llm_spans) / len(llm_spans)
             if llm_spans
             else 0.0
         )
-        return ObservabilityReport(
-            calls=self.call_count,
-            total_cost=self.total_cost,
-            mean_llm_latency=mean_lat,
-            alerts=list(self.alerts),
-            spans=list(self.tracer.spans),
-        )
+        return {
+            "calls": self.call_count,
+            "total_cost": self.total_cost,
+            "avg_latency": avg,
+            "alerts": list(self.alerts),
+        }

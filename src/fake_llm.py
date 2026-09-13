@@ -1,50 +1,43 @@
-"""Deterministic FakeLLM for offline testing.
+"""Deterministic fake LLM used by all agent-project grading suites.
 
-Returns scripted text or raises scripted exceptions, records calls.
-Do not modify this file in the real challenge; provided here for completeness.
+Scoring never calls a real model: tests inject scripted responses, so grading
+is deterministic, instant, and free. Candidates code against this interface.
 """
-
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Sequence, Union
-
-
-@dataclass
-class LLMCall:
-    prompt: str
-    kwargs: dict
 
 
 class FakeLLM:
-    """Scripted LLM that returns predetermined responses in order."""
+    """Scripted LLM client. Pops one response per complete() call.
 
-    def __init__(
-        self,
-        responses: Optional[Sequence[Union[str, Exception, Callable[[str], str]]]] = None,
-        default: str = "OK",
-    ):
-        self.responses = list(responses or [])
-        self.default = default
-        self.calls: List[LLMCall] = []
-        self._index = 0
+    responses: list of str (returned as-is) or Exception (raised) —
+    lets tests simulate malformed JSON, transient failures, etc.
+    """
 
-    def complete(self, prompt: str, **kwargs: Any) -> str:
-        self.calls.append(LLMCall(prompt=prompt, kwargs=kwargs))
-        if self._index < len(self.responses):
-            resp = self.responses[self._index]
-            self._index += 1
-            if isinstance(resp, Exception):
-                raise resp
-            if callable(resp):
-                return resp(prompt)
-            return str(resp)
-        return self.default
+    def __init__(self, responses, name="fake-small", cost_per_1k=(0.15, 0.60)):
+        self._responses = list(responses)
+        self.name = name
+        self.cost_in_per_1k, self.cost_out_per_1k = cost_per_1k
+        self.calls = []  # [{"prompt": ..., "response": ...|None, "error": ...|None}]
 
-    def reset(self) -> None:
-        self.calls.clear()
-        self._index = 0
+    def complete(self, prompt: str) -> str:
+        if not self._responses:
+            raise RuntimeError("FakeLLM exhausted its scripted responses")
+        resp = self._responses.pop(0)
+        if isinstance(resp, Exception):
+            self.calls.append({"prompt": prompt, "response": None, "error": repr(resp)})
+            raise resp
+        self.calls.append({"prompt": prompt, "response": resp, "error": None})
+        return resp
 
     @property
     def call_count(self) -> int:
         return len(self.calls)
+
+    def token_usage(self) -> tuple[int, int]:
+        """Crude deterministic token count: whitespace-split words."""
+        tokens_in = sum(len(c["prompt"].split()) for c in self.calls)
+        tokens_out = sum(len((c["response"] or "").split()) for c in self.calls)
+        return tokens_in, tokens_out
+
+    def cost(self) -> float:
+        tokens_in, tokens_out = self.token_usage()
+        return (tokens_in / 1000) * self.cost_in_per_1k + (tokens_out / 1000) * self.cost_out_per_1k

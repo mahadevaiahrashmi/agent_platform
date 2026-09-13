@@ -1,121 +1,110 @@
-"""Process events idempotently with bounded retry, exponential backoff, dead-lettering, and replay.
+"""Project 7 — Event-Triggered Automation Agent.
 
-Successful and dead-lettered IDs reject later duplicates; unknown types
-dead-letter without retry; handler failures retry max_retries additional times
-with delays 1, 2, 4, ...; final dead-letter records contain the last error and
-total attempts; process() never raises; replay bypasses dead-letter
-idempotency, counts recoveries, and does not duplicate failed entries.
+Consume webhook/queue events with idempotent execution, bounded retries with
+exponential backoff, and a dead-letter queue. No LLM involved — this grades
+production automation engineering.
+
+An event is {"id": str, "type": str, "payload": dict}.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set
 
 
-@dataclass
-class DeadLetterRecord:
-    event_id: str
-    event_type: str
-    payload: Any
-    last_error: str
-    attempts: int
-
-
-@dataclass
-class ProcessResult:
-    status: str  # "success" | "duplicate" | "dead_letter" | "unknown_type"
-    event_id: str
-    attempts: int = 0
-    error: Optional[str] = None
-
-
-class EventAutomation:
-    def __init__(
-        self,
-        handlers: Dict[str, Callable[[Any], None]],
-        max_retries: int = 3,
-        sleep_fn: Callable[[float], None] = time.sleep,
-    ):
+class EventProcessor:
+    def __init__(self, handlers: dict, max_retries: int = 3, sleep=None):
+        """handlers: event type -> callable(payload) -> result.
+        sleep: injectable sleep function (tests pass a recorder; default
+        time.sleep). Must set up:
+            - self.processed: {event_id: result} of successful events
+            - self.dead_letter: list of {"event": event, "error": str,
+              "attempts": int}
+        """
         self.handlers = handlers
         self.max_retries = max_retries
-        self._sleep = sleep_fn
-        self._processed: Set[str] = set()
-        self._dead_lettered: Set[str] = set()
-        self.dead_letters: List[DeadLetterRecord] = []
-        self.recovery_count = 0
+        self.sleep = sleep if sleep is not None else time.sleep
+        self.processed: Dict[str, Any] = {}
+        self.dead_letter: List[dict] = []
+        self._seen_ids: Set[str] = set()  # success OR dead-lettered
 
-    def process(self, event_id: str, event_type: str, payload: Any) -> ProcessResult:
-        """Process an event idempotently. Never raises."""
-        if event_id in self._processed or event_id in self._dead_lettered:
-            return ProcessResult(status="duplicate", event_id=event_id)
+    def process(self, event: dict) -> dict:
+        """Process one event.
+
+        Requirements:
+            - IDEMPOTENT: an event id seen before (success OR dead-lettered)
+              returns {"status": "duplicate"} without invoking the handler.
+            - Unknown event type -> straight to dead_letter (no retries),
+              return {"status": "dead_letter"}.
+            - Handler exceptions: retry up to max_retries additional attempts,
+              calling self.sleep(2 ** attempt) between attempts (1, 2, 4...).
+            - Success -> {"status": "ok", "result": ...} and record in
+              self.processed.
+            - Still failing after retries -> append to dead_letter with the
+              LAST error string and total attempt count, return
+              {"status": "dead_letter"}.
+            - process() never raises.
+        """
+        event_id = event["id"]
+        if event_id in self._seen_ids:
+            return {"status": "duplicate"}
+
+        event_type = event.get("type")
+        payload = event.get("payload")
 
         if event_type not in self.handlers:
-            rec = DeadLetterRecord(
-                event_id=event_id,
-                event_type=event_type,
-                payload=payload,
-                last_error=f"Unknown event type: {event_type}",
-                attempts=1,
+            self.dead_letter.append(
+                {
+                    "event": event,
+                    "error": f"Unknown event type: {event_type}",
+                    "attempts": 1,
+                }
             )
-            self.dead_letters.append(rec)
-            self._dead_lettered.add(event_id)
-            return ProcessResult(
-                status="unknown_type",
-                event_id=event_id,
-                attempts=1,
-                error=rec.last_error,
-            )
+            self._seen_ids.add(event_id)
+            return {"status": "dead_letter"}
 
         handler = self.handlers[event_type]
         last_error = ""
-        # Initial attempt + max_retries additional
-        for attempt in range(1, self.max_retries + 2):
+        # attempt 0 is first try; then max_retries more
+        total_attempts = self.max_retries + 1
+        for attempt in range(total_attempts):
             try:
-                handler(payload)
-                self._processed.add(event_id)
-                return ProcessResult(status="success", event_id=event_id, attempts=attempt)
+                result = handler(payload)
+                self.processed[event_id] = result
+                self._seen_ids.add(event_id)
+                return {"status": "ok", "result": result}
             except Exception as exc:
                 last_error = str(exc)
-                if attempt <= self.max_retries:
-                    delay = 2 ** (attempt - 1)  # 1, 2, 4, ...
-                    self._sleep(delay)
+                if attempt < self.max_retries:
+                    # sleep(2 ** attempt) => 1, 2, 4, ...
+                    self.sleep(2 ** attempt)
 
-        # Exhausted retries → dead letter
-        rec = DeadLetterRecord(
-            event_id=event_id,
-            event_type=event_type,
-            payload=payload,
-            last_error=last_error,
-            attempts=self.max_retries + 1,
+        # Exhausted
+        self.dead_letter.append(
+            {
+                "event": event,
+                "error": last_error,
+                "attempts": total_attempts,
+            }
         )
-        self.dead_letters.append(rec)
-        self._dead_lettered.add(event_id)
-        return ProcessResult(
-            status="dead_letter",
-            event_id=event_id,
-            attempts=self.max_retries + 1,
-            error=last_error,
-        )
+        self._seen_ids.add(event_id)
+        return {"status": "dead_letter"}
 
-    def replay(self, event_id: str) -> ProcessResult:
-        """Replay a dead-lettered event, bypassing dead-letter idempotency.
-
-        Does not duplicate the dead-letter entry. Counts as a recovery.
-        """
-        rec = next((d for d in self.dead_letters if d.event_id == event_id), None)
-        if rec is None:
-            return ProcessResult(status="unknown", event_id=event_id, error="not in dead letters")
-
-        # Temporarily remove from dead-lettered set so process can run
-        self._dead_lettered.discard(event_id)
-        result = self.process(rec.event_id, rec.event_type, rec.payload)
-        if result.status == "success":
-            self.recovery_count += 1
-            # Remove the old dead-letter record (do not leave a duplicate failed entry)
-            self.dead_letters = [d for d in self.dead_letters if d.event_id != event_id]
-        else:
-            # Re-add if it failed again
-            self._dead_lettered.add(event_id)
-        return result
+    def replay_dead_letter(self) -> int:
+        """Retry every dead-lettered event once more through process()
+        (idempotency must not block the replay). Return how many succeeded.
+        Events that fail again remain dead-lettered exactly once (no dupes)."""
+        to_replay = list(self.dead_letter)
+        self.dead_letter = []
+        recovered = 0
+        for entry in to_replay:
+            event = entry["event"]
+            event_id = event["id"]
+            # Allow re-processing by removing from seen set
+            self._seen_ids.discard(event_id)
+            result = self.process(event)
+            if result.get("status") == "ok":
+                recovered += 1
+            # if it failed again, process() already put it back in dead_letter
+        return recovered

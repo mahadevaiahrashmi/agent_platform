@@ -1,125 +1,104 @@
-"""Gather independent proposals, score them with a critic, and synthesize the selected answer.
+"""Project 8 — Multi-Agent Debate System.
 
-Proposers do not see one another's work; the critic sees every proposal and is
-called once; highest score wins with lower index breaking ties; confidence is
-the clamped winner score minus the mean of other scores, or the winner score
-for one proposer; the aggregator receives the question, winning proposal, and
-its critique exactly once; the required result fields are returned.
+N proposer agents answer independently, a critic scores each proposal,
+consensus picks a winner, and an aggregator synthesizes the final answer
+with a confidence value.
+
+Proposers reply with plain text. The critic replies with JSON:
+{"scores": [{"index": 0, "score": 0.0-1.0, "critique": "..."}, ...]}.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, List, Optional, Sequence
+import json
+from typing import Any, List
 
 
-@dataclass
-class Proposal:
-    index: int
-    text: str
-    score: float = 0.0
-    critique: str = ""
+class Debate:
+    def __init__(self, proposers: list, critic, aggregator):
+        """proposers: LLM clients; critic and aggregator: LLM clients."""
+        self.proposers = proposers
+        self.critic = critic
+        self.aggregator = aggregator
 
+    def run(self, question: str) -> dict:
+        """Run one debate round.
 
-@dataclass
-class DebateResult:
-    answer: str
-    winning_proposal: str
-    confidence: float
-    scores: List[float]
-    critiques: List[str]
-    selected_index: int
+        Requirements:
+            - Every proposer is asked the question independently (its prompt
+              must NOT contain other proposals).
+            - The critic is called once; its prompt must contain ALL proposals;
+              parse its scores.
+            - Winner = highest score; ties break on LOWER index (deterministic).
+            - confidence = winner_score - mean(other scores), clamped to
+              [0.0, 1.0]. Single proposer -> confidence = winner_score.
+            - The aggregator is called once with the question, the winning
+              proposal, and the critic's critique of it; its text response is
+              the final answer.
+            - Return {"answer": <aggregator text>, "winner_index": int,
+              "confidence": float, "proposals": [str, ...],
+              "scores": [float, ...]}.
+        """
+        # Independent proposals
+        proposals: List[str] = []
+        for p in self.proposers:
+            text = p.complete(question)
+            proposals.append(text)
 
-
-class DebateSystem:
-    def __init__(
-        self,
-        proposer_llm: Any,
-        critic_llm: Any,
-        aggregator_llm: Any,
-        num_proposers: int = 3,
-    ):
-        self.proposer_llm = proposer_llm
-        self.critic_llm = critic_llm
-        self.aggregator_llm = aggregator_llm
-        self.num_proposers = num_proposers
-
-    def run(self, question: str) -> DebateResult:
-        # Independent proposals – proposers do not see each other
-        proposals: List[Proposal] = []
-        for i in range(self.num_proposers):
-            prompt = (
-                f"Propose a clear, self-contained answer to the following question.\n\n"
-                f"Question: {question}\n\n"
-                f"Proposal:"
-            )
-            text = self.proposer_llm.complete(prompt)
-            proposals.append(Proposal(index=i, text=text.strip()))
-
-        # Critic sees every proposal, called once
-        critic_prompt_parts = [
-            "Score each proposal from 0.0 to 1.0 and provide a short critique.",
-            f"Question: {question}",
-            "",
-        ]
-        for p in proposals:
-            critic_prompt_parts.append(f"Proposal {p.index}:\n{p.text}\n")
+        # Critic sees all
+        critic_prompt_parts = [f"Question: {question}", "", "Proposals:"]
+        for i, prop in enumerate(proposals):
+            critic_prompt_parts.append(f"[{i}] {prop}")
         critic_prompt_parts.append(
-            "Respond with one line per proposal: SCORE: <float> CRITIQUE: <text>"
+            "\nRespond with JSON: "
+            '{"scores": [{"index": 0, "score": 0.0-1.0, "critique": "..."}, ...]}'
         )
-        critic_raw = self.critic_llm.complete("\n".join(critic_prompt_parts))
+        critic_raw = self.critic.complete("\n".join(critic_prompt_parts))
+        critic_data = json.loads(critic_raw)
+        score_entries = critic_data["scores"]
 
-        # Parse critic output (best-effort)
-        lines = [ln.strip() for ln in critic_raw.splitlines() if ln.strip()]
-        for i, p in enumerate(proposals):
-            score = 0.5
-            critique = ""
-            if i < len(lines):
-                line = lines[i]
-                # crude parse
-                import re
-                m = re.search(r"(?i)SCORE\s*[:\-]?\s*([0-9.]+)", line)
-                if m:
-                    try:
-                        score = float(m.group(1))
-                        score = max(0.0, min(1.0, score))
-                    except ValueError:
-                        pass
-                m2 = re.search(r"(?i)CRITIQUE\s*[:\-]?\s*(.*)$", line)
-                if m2:
-                    critique = m2.group(1).strip()
-                else:
-                    critique = line
-            p.score = score
-            p.critique = critique
+        # Build score + critique lists aligned by index
+        scores = [0.0] * len(proposals)
+        critiques = [""] * len(proposals)
+        for entry in score_entries:
+            idx = int(entry["index"])
+            if 0 <= idx < len(proposals):
+                scores[idx] = float(entry["score"])
+                critiques[idx] = str(entry.get("critique", ""))
 
-        # Highest score wins; lower index breaks ties
-        ranked = sorted(proposals, key=lambda p: (-p.score, p.index))
-        winner = ranked[0]
+        # Winner: highest score, lower index on tie
+        winner_index = 0
+        for i in range(1, len(scores)):
+            if scores[i] > scores[winner_index] or (
+                scores[i] == scores[winner_index] and i < winner_index
+            ):
+                winner_index = i
+        # Actually lower index already preferred by scanning left-to-right with >
+        # but to be explicit:
+        best = max(range(len(scores)), key=lambda i: (scores[i], -i))
+        winner_index = best
 
-        # Confidence: winner - mean(others), clamped; or winner if single
-        if len(proposals) == 1:
-            confidence = winner.score
+        winner_score = scores[winner_index]
+        if len(scores) == 1:
+            confidence = winner_score
         else:
-            others = [p.score for p in proposals if p.index != winner.index]
+            others = [s for i, s in enumerate(scores) if i != winner_index]
             mean_others = sum(others) / len(others) if others else 0.0
-            confidence = max(0.0, min(1.0, winner.score - mean_others))
+            confidence = max(0.0, min(1.0, winner_score - mean_others))
 
-        # Aggregator receives question, winning proposal, its critique exactly once
+        # Aggregator
         agg_prompt = (
-            f"Synthesize a final answer.\n\n"
             f"Question: {question}\n\n"
-            f"Winning proposal:\n{winner.text}\n\n"
-            f"Critique of winning proposal:\n{winner.critique}\n\n"
-            f"Final answer:"
+            f"Winning proposal: {proposals[winner_index]}\n\n"
+            f"Critique: {critiques[winner_index]}\n\n"
+            f"Synthesize the final answer:"
         )
-        answer = self.aggregator_llm.complete(agg_prompt).strip()
+        answer = self.aggregator.complete(agg_prompt)
 
-        return DebateResult(
-            answer=answer,
-            winning_proposal=winner.text,
-            confidence=confidence,
-            scores=[p.score for p in proposals],
-            critiques=[p.critique for p in proposals],
-            selected_index=winner.index,
-        )
+        return {
+            "answer": answer,
+            "winner_index": winner_index,
+            "confidence": confidence,
+            "proposals": proposals,
+            "scores": scores,
+        }

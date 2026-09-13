@@ -1,162 +1,145 @@
-"""Gate low-confidence or protected actions behind resumable approval tickets.
+"""Project 5 — Human-in-the-Loop Approval Agent.
 
-A request event is always logged first; confident, unprotected work completes
-automatically; low confidence or a protected action pauses with the specified
-reason and does not execute the action; approval returns the pending answer,
-rejection aborts, and each ticket resolves once; audit events remain ordered
-and can be filtered by ticket, including the human note.
+Uncertainty detection -> pause -> request human input -> resume with validated
+context, with a complete, ordered audit trail.
+
+The LLM replies with JSON: {"answer": "...", "confidence": 0.0-1.0,
+"action": "<name>"|null}.
 """
 
 from __future__ import annotations
 
+import json
 import itertools
-import time
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 
-class TicketStatus(str, Enum):
-    PENDING = "pending"
-    APPROVED = "approved"
-    REJECTED = "rejected"
-    AUTO = "auto"
+class UnknownTicket(Exception):
+    pass
 
 
-@dataclass
-class AuditEvent:
-    ticket_id: str
-    event: str
-    timestamp: float
-    detail: Optional[str] = None
-    human_note: Optional[str] = None
-
-
-@dataclass
-class Ticket:
-    id: str
-    action: str
-    answer: Any
-    reason: str
-    status: TicketStatus = TicketStatus.PENDING
-    confidence: float = 0.0
-    protected: bool = False
-
-
-class HITLApproval:
+class ApprovalAgent:
     def __init__(
         self,
-        confidence_threshold: float = 0.7,
-        protected_actions: Optional[set] = None,
-        clock: Callable[[], float] = time.time,
+        llm,
+        confidence_threshold: float = 0.75,
+        protected_actions: set[str] = frozenset({"delete", "send_email", "refund"}),
     ):
-        self.confidence_threshold = confidence_threshold
-        self.protected_actions = protected_actions or set()
-        self._clock = clock
-        self._tickets: Dict[str, Ticket] = {}
-        self._audit: List[AuditEvent] = []
-        self._id_counter = itertools.count(1)
-
-    def _log(self, ticket_id: str, event: str, detail: str | None = None, human_note: str | None = None) -> None:
-        self._audit.append(
-            AuditEvent(
-                ticket_id=ticket_id,
-                event=event,
-                timestamp=self._clock(),
-                detail=detail,
-                human_note=human_note,
-            )
-        )
-
-    def request(
-        self,
-        action: str,
-        answer: Any,
-        confidence: float,
-        *,
-        reason: str = "low_confidence",
-    ) -> dict:
-        """Submit work for possible human approval.
-
-        Always logs a request event.  If confidence is high enough and the
-        action is not protected, the work is auto-approved and executed
-        (returned as completed).  Otherwise a pending ticket is created.
+        """Must set up:
+            - self.audit_log: append-only list of events, each
+              {"event": str, "detail": dict} — events in the order they happen.
+            - internal storage for paused tickets.
         """
-        tid = f"t-{next(self._id_counter)}"
-        protected = action in self.protected_actions
-        self._log(tid, "request", detail=f"action={action} confidence={confidence}")
+        self.llm = llm
+        self.confidence_threshold = confidence_threshold
+        self.protected_actions: Set[str] = set(protected_actions)
+        self.audit_log: List[dict] = []
+        self._tickets: Dict[str, dict] = {}
+        self._id_gen = itertools.count(1)
 
-        needs_approval = confidence < self.confidence_threshold or protected
-        if not needs_approval:
-            ticket = Ticket(
-                id=tid,
-                action=action,
-                answer=answer,
-                reason="auto",
-                status=TicketStatus.AUTO,
-                confidence=confidence,
-                protected=protected,
-            )
-            self._tickets[tid] = ticket
-            self._log(tid, "auto_approved")
-            return {
-                "status": "completed",
-                "ticket_id": tid,
-                "answer": answer,
-            }
+    def handle(self, request: str) -> dict:
+        """Process a request.
 
-        # Pause – do not execute
-        actual_reason = reason
-        if protected and confidence >= self.confidence_threshold:
-            actual_reason = "protected_action"
-        ticket = Ticket(
-            id=tid,
-            action=action,
-            answer=answer,
-            reason=actual_reason,
-            status=TicketStatus.PENDING,
-            confidence=confidence,
-            protected=protected,
+        Requirements:
+            - Call the LLM once, parse its JSON.
+            - Log {"event": "request", ...} first, always.
+            - AUTO path: confidence >= threshold AND action not protected ->
+              log "completed" and return
+              {"status": "completed", "answer": ..., "ticket": None}.
+            - PAUSE path: low confidence OR protected action -> create a
+              ticket id, log "paused" with a "reason" of "low_confidence" or
+              "protected_action", store the pending answer/action, and return
+              {"status": "pending", "ticket": <id>, "reason": ...}.
+              The protected action MUST NOT be considered executed.
+        """
+        self.audit_log.append(
+            {"event": "request", "detail": {"request": request}}
         )
-        self._tickets[tid] = ticket
-        self._log(tid, "paused", detail=actual_reason)
+
+        raw = self.llm.complete(request)
+        data = json.loads(raw)
+        answer = data.get("answer")
+        confidence = float(data.get("confidence", 0.0))
+        action = data.get("action")  # may be None
+
+        is_protected = action is not None and action in self.protected_actions
+        low_conf = confidence < self.confidence_threshold
+
+        if not low_conf and not is_protected:
+            self.audit_log.append(
+                {"event": "completed", "detail": {"answer": answer}}
+            )
+            return {"status": "completed", "answer": answer, "ticket": None}
+
+        # Pause
+        ticket_id = f"ticket-{next(self._id_gen)}"
+        reason = "protected_action" if is_protected else "low_confidence"
+        self._tickets[ticket_id] = {
+            "answer": answer,
+            "action": action,
+            "resolved": False,
+        }
+        self.audit_log.append(
+            {
+                "event": "paused",
+                "detail": {"ticket": ticket_id, "reason": reason},
+            }
+        )
         return {
             "status": "pending",
-            "ticket_id": tid,
-            "reason": actual_reason,
-            "answer": None,  # not executed yet
+            "ticket": ticket_id,
+            "reason": reason,
         }
 
-    def approve(self, ticket_id: str, note: str = "") -> dict:
-        ticket = self._tickets.get(ticket_id)
+    def resume(self, ticket: str, approved: bool, human_note: str = "") -> dict:
+        """Resume a paused ticket with the human decision.
+
+        Requirements:
+            - Unknown/already-resolved ticket -> raise UnknownTicket.
+            - Log "human_decision" (with approved + note), then:
+              approved -> log "completed", return {"status": "completed",
+              "answer": <pending answer>}.
+              rejected -> log "aborted", return {"status": "aborted",
+              "answer": None}.
+            - A ticket can be resumed exactly once.
+        """
+        if ticket not in self._tickets or self._tickets[ticket]["resolved"]:
+            raise UnknownTicket(f"Unknown or already resolved ticket: {ticket}")
+
+        self.audit_log.append(
+            {
+                "event": "human_decision",
+                "detail": {
+                    "ticket": ticket,
+                    "approved": approved,
+                    "note": human_note,
+                },
+            }
+        )
+
+        pending = self._tickets[ticket]
+        pending["resolved"] = True
+
+        if approved:
+            self.audit_log.append(
+                {
+                    "event": "completed",
+                    "detail": {"ticket": ticket, "answer": pending["answer"]},
+                }
+            )
+            return {"status": "completed", "answer": pending["answer"]}
+        else:
+            self.audit_log.append(
+                {"event": "aborted", "detail": {"ticket": ticket}}
+            )
+            return {"status": "aborted", "answer": None}
+
+    def audit_trail(self, ticket: str | None = None) -> list[dict]:
+        """Full audit log, or only events whose detail carries this ticket."""
         if ticket is None:
-            raise KeyError(f"Unknown ticket: {ticket_id}")
-        if ticket.status != TicketStatus.PENDING:
-            raise RuntimeError(f"Ticket {ticket_id} already resolved as {ticket.status}")
-        ticket.status = TicketStatus.APPROVED
-        self._log(ticket_id, "approved", human_note=note or None)
-        return {
-            "status": "completed",
-            "ticket_id": ticket_id,
-            "answer": ticket.answer,
-        }
-
-    def reject(self, ticket_id: str, note: str = "") -> dict:
-        ticket = self._tickets.get(ticket_id)
-        if ticket is None:
-            raise KeyError(f"Unknown ticket: {ticket_id}")
-        if ticket.status != TicketStatus.PENDING:
-            raise RuntimeError(f"Ticket {ticket_id} already resolved as {ticket.status}")
-        ticket.status = TicketStatus.REJECTED
-        self._log(ticket_id, "rejected", human_note=note or None)
-        return {
-            "status": "aborted",
-            "ticket_id": ticket_id,
-            "answer": None,
-        }
-
-    def audit_log(self, ticket_id: Optional[str] = None) -> List[AuditEvent]:
-        """Return audit events, optionally filtered by ticket_id, in order."""
-        if ticket_id is None:
-            return list(self._audit)
-        return [e for e in self._audit if e.ticket_id == ticket_id]
+            return list(self.audit_log)
+        return [
+            e
+            for e in self.audit_log
+            if e.get("detail", {}).get("ticket") == ticket
+        ]
