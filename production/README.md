@@ -1,26 +1,23 @@
 # Production Agent Platform (stack-independent)
 
 All modules remain compatible with the original **64 graded tests**.
-Optional production features default off or to in-memory no-ops.
+Optional production features live **inside** the same module files (no extra support packages).
 
-## New support modules
-- `config.py` — AgentConfig, CancellationToken, Deadline, RunState
-- `interfaces.py` — BudgetChecker, RelevanceScorer, SpanExporter, TicketStore, EventStore, MetricsHook (in-memory defaults)
-- `errors.py` — tool/agent error taxonomy
-
-## List-A features implemented
+## List-A features (inlined in each module)
 | Module | Features |
 |--------|----------|
 | structured_output | Circuit breaker, metrics hooks, schema_version |
-| react_loop | overall_timeout, cancel_token, per-tool timeouts, allow/deny, idempotency_key, run_id, checkpoint |
+| react_loop | overall_timeout, cancel token, per-tool timeouts, allow/deny, idempotency_key, run_id, checkpoint |
 | tool_orchestrator | timeouts, arg_schema validation, rate limits, structured errors |
 | memory_agent | pluggable scorer, redactor, TTL, max_long_term |
-| hitl_approval | ticket TTL, required_approvals (dual-control), TicketStore |
-| cost_router | pluggable BudgetChecker, task_cost_ceiling, fail_open |
-| event_automation | jitter, max_event_age, max_replay_attempts (poison), EventStore |
+| hitl_approval | ticket TTL, required_approvals, in-memory ticket store |
+| cost_router | in-memory budget helper, task_cost_ceiling, fail_open |
+| event_automation | jitter, max_event_age, max_replay_attempts (poison), in-memory seen-store |
 | debate_system | parallel proposers, cost_ceiling |
 | self_eval | cost_ceiling |
-| observability | SpanExporter, correlation_id, prompt redactor |
+| observability | span exporter hook, correlation_id, prompt redactor |
+
+Docstrings match the original problem statements.
 
 ## Run graded tests
 ```bash

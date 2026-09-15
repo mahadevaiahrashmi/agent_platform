@@ -1,4 +1,7 @@
-"""Project 3 — Tool Orchestrator (production, stack-independent)."""
+"""Project 3 — Multi-Tool Orchestrator.
+Dynamic tool registry, capability-based routing with priority conflict
+resolution, permission scoping, and parallel execution.
+"""
 from __future__ import annotations
 
 import time
@@ -7,7 +10,19 @@ from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
-from errors import ToolTimeoutError, ToolValidationError, classify_tool_exception
+class ToolTimeoutError(Exception):
+    code = "tool_timeout"
+
+class ToolValidationError(Exception):
+    code = "tool_validation"
+
+def classify_tool_exception(exc):
+    if isinstance(exc, (ToolTimeoutError, ToolValidationError)):
+        return exc
+    if isinstance(exc, TimeoutError):
+        return ToolTimeoutError(str(exc))
+    return exc
+
 
 
 @dataclass
@@ -49,16 +64,23 @@ class _RateLimiter:
 
 class Orchestrator:
     def __init__(self, default_timeout: Optional[float] = None):
+        """Set up an empty registry."""
         self._registry: Dict[str, Tool] = {}
         self.default_timeout = default_timeout
         self._limiters: Dict[str, _RateLimiter] = {}
 
     def register(self, tool: Tool) -> None:
+        """Add a tool. Re-registering the same name replaces it."""
         self._registry[tool.name] = tool
         if tool.rate_limit_per_sec and tool.rate_limit_per_sec > 0:
             self._limiters[tool.name] = _RateLimiter(tool.rate_limit_per_sec)
 
     def resolve(self, capability: str) -> Tool:
+        """Return the tool for a capability.
+Requirements:
+    - If several tools share the capability, the highest `priority`
+      wins; ties break alphabetically by name (deterministic).
+    - Unknown capability -> KeyError."""
         candidates = [t for t in self._registry.values() if capability in t.capabilities]
         if not candidates:
             raise KeyError(f"No tool for capability: {capability}")
@@ -96,6 +118,10 @@ class Orchestrator:
         timeout: Optional[float] = None,
         **kwargs,
     ):
+        """Resolve and run one tool.
+Requirements:
+    - If the tool has a required_scope not present in `scopes`,
+      raise PermissionDenied WITHOUT executing the tool."""
         tool = self.resolve(capability)
         if tool.required_scope is not None and tool.required_scope not in scopes:
             raise PermissionDenied(
@@ -136,6 +162,14 @@ class Orchestrator:
         scopes: set[str],
         timeout: Optional[float] = None,
     ) -> list[dict]:
+        """Run many tasks concurrently (threads); each task is
+{"capability": str, "kwargs": dict}.
+Requirements:
+    - MUST use real concurrency (concurrent.futures) — grading asserts
+      wall-clock time of parallel sleeps.
+    - Results return IN INPUT ORDER as
+      {"ok": True, "result": ...} or {"ok": False, "error": str}.
+    - One failing/forbidden task must not affect the others."""
         results: List[Optional[dict]] = [None] * len(tasks)
         limit = timeout if timeout is not None else self.default_timeout
 

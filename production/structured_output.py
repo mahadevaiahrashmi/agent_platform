@@ -1,28 +1,49 @@
-"""Project 1 — Structured Output (production, stack-independent)."""
+"""Project 1 — Structured Output Agent.
+Make LLM output reliable: enforce a Pydantic schema, retry on parse/validation
+errors feeding the error back to the model, and log every failure.
+"""
 from __future__ import annotations
 import json, time
 from typing import Optional
 from pydantic import BaseModel, ValidationError
-from errors import CircuitOpenError
-from interfaces import MetricsHook, NullMetrics
+
+class CircuitOpenError(Exception):
+    pass
+
+class NullMetrics:
+    def record(self, name: str, value: float = 1.0, **labels):
+        return None
 
 class ExtractionError(Exception):
     """Raised when the LLM cannot produce schema-valid output within retries."""
 
 class StructuredAgent:
     def __init__(self, llm, schema: type[BaseModel], max_retries: int = 2, *,
-                 circuit_failure_threshold: int = 0, metrics: Optional[MetricsHook] = None,
+                 circuit_failure_threshold: int = 0, metrics=None,
                  schema_version: str = "1"):
+        """Initialize with an LLM client, a Pydantic model class, and a retry cap.
+Must set up:
+    - self.llm, self.schema, self.max_retries
+    - self.failures: list of dicts logging every failed attempt
+      ({"attempt": int, "raw": str, "error": str})"""
         self.llm = llm
         self.schema = schema
         self.max_retries = max_retries
         self.failures: list[dict] = []
         self.circuit_failure_threshold = circuit_failure_threshold
         self._consecutive_failures = 0
-        self.metrics: MetricsHook = metrics or NullMetrics()
+        self.metrics = metrics or NullMetrics()
         self.schema_version = schema_version
 
     def build_prompt(self, text: str, previous_error: str | None = None) -> str:
+        """Build the extraction prompt.
+Requirements:
+    - MUST include the schema's JSON structure (use
+      self.schema.model_json_schema()) so the model knows the contract.
+    - MUST include the source text.
+    - When retrying, MUST include the previous validation error verbatim
+      so the model can correct itself. Retries that don't feed the error
+      back are scored as incorrect."""
         schema_json = json.dumps(self.schema.model_json_schema(), indent=2)
         parts = [
             "Extract structured data matching the following JSON schema.",
@@ -42,6 +63,15 @@ class StructuredAgent:
             return self.schema.model_validate(data)
 
     def extract(self, text: str) -> BaseModel:
+        """Extract a validated instance of self.schema from text.
+Requirements:
+    - Call the LLM, parse the response as JSON, validate with the schema
+      (schema.model_validate_json or equivalent).
+    - On parse/validation failure: log to self.failures and retry with
+      the error fed back, up to self.max_retries retries
+      (max_retries + 1 total attempts).
+    - After exhausting retries, raise ExtractionError. All failures must
+      remain logged in self.failures."""
         if (self.circuit_failure_threshold > 0 and
                 self._consecutive_failures >= self.circuit_failure_threshold):
             raise CircuitOpenError(

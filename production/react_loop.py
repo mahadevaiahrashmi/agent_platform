@@ -1,11 +1,68 @@
-"""Project 2 — ReAct (production, stack-independent)."""
+"""Project 2 — ReAct Planning Agent.
+Observe -> think -> act loop with a hard iteration cap, unknown-tool recovery,
+and graceful degradation instead of infinite looping.
+
+The LLM is called with the running trace and must reply with JSON:
+    {"thought": "...", "action": "<tool name>", "args": {...}}   -- act
+    {"thought": "...", "final": "<answer>"}                       -- finish
+"""
 from __future__ import annotations
 import json, time, uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any, Callable, Dict, List, Optional
-from config import AgentConfig, CancellationToken, CancelledError, Deadline, RunState
-from errors import classify_tool_exception
+
+class CancelledError(Exception):
+    pass
+
+class CancellationToken:
+    def __init__(self):
+        self._cancelled = False
+        self.reason = None
+    def cancel(self, reason: str = "cancelled"):
+        self._cancelled = True
+        self.reason = reason
+    @property
+    def is_cancelled(self):
+        return self._cancelled
+    def raise_if_cancelled(self):
+        if self._cancelled:
+            raise CancelledError(self.reason or "cancelled")
+
+class Deadline:
+    def __init__(self, seconds, clock):
+        self._clock = clock
+        self._deadline = None if seconds is None or seconds <= 0 else clock() + seconds
+    def expired(self):
+        return self._deadline is not None and self._clock() >= self._deadline
+    def raise_if_expired(self):
+        if self.expired():
+            raise TimeoutError("overall deadline exceeded")
+
+class AgentConfig:
+    def __init__(self, max_iterations=5, tool_timeout=None, overall_timeout=None,
+                 per_tool_timeouts=None, max_output_chars=None,
+                 tool_allowlist=None, tool_denylist=None):
+        self.max_iterations = max_iterations
+        self.tool_timeout = tool_timeout
+        self.overall_timeout = overall_timeout
+        self.per_tool_timeouts = per_tool_timeouts or {}
+        self.max_output_chars = max_output_chars
+        self.tool_allowlist = tool_allowlist
+        self.tool_denylist = tool_denylist
+
+class RunState:
+    def __init__(self, run_id, goal, status, iterations=0, answer=None, trace=None, meta=None):
+        self.run_id = run_id
+        self.goal = goal
+        self.status = status
+        self.iterations = iterations
+        self.answer = answer
+        self.trace = trace or []
+        self.meta = meta or {}
+
+def classify_tool_exception(exc):
+    return exc
 
 def _run_with_timeout(fn: Callable, kwargs: dict, timeout: Optional[float]) -> Any:
     if timeout is None or timeout <= 0:
@@ -25,6 +82,9 @@ class ReActAgent:
                  cancel_token: Optional[CancellationToken] = None,
                  clock: Optional[Callable[[], float]] = None,
                  idempotency_key: Optional[str] = None):
+        """tools maps name -> callable(**args) -> str.
+Must set up self.trace: list of step dicts, in order, each
+{"thought": str, "action": str | None, "observation": str | None}."""
         self.llm = llm
         self.tools: Dict[str, Callable[..., Any]] = tools
         self.config = config or AgentConfig(
@@ -45,6 +105,23 @@ class ReActAgent:
         self.last_run: Optional[RunState] = None
 
     def run(self, goal: str) -> dict:
+        """Run the ReAct loop for a goal.
+Requirements:
+    - Each iteration: call the LLM with the goal plus all prior
+      thoughts/observations, parse its JSON decision.
+    - "final" decision -> return {"status": "done", "answer": final,
+      "iterations": n}.
+    - Action decision -> execute the tool, append the observation to
+      the trace, continue.
+    - Unknown tool or tool exception MUST NOT crash the loop: record
+      an error observation ("ERROR: ...") and continue, letting the
+      model recover.
+    - Unparseable LLM output counts as an iteration with observation
+      "ERROR: invalid decision format".
+    - After max_iterations without "final": degrade gracefully -->
+      return {"status": "max_iterations", "answer": <best-effort
+      summary of the trace, non-empty>, "iterations": max_iterations}.
+      Never loop past the cap; never raise."""
         run_id = str(uuid.uuid4())
         deadline = Deadline(self.overall_timeout, self._clock)
         self.trace = []

@@ -1,10 +1,30 @@
-"""Project 6 — Cost Router (production, stack-independent)."""
+"""Project 6 — Cost-Aware Agent Router.
+Route tasks to the cheapest capable model, keep a hard token budget,
+exit early on confident cheap answers, and report cost analytics.
+
+Each model config: {"client": <llm>, "cost_per_call": float,
+"max_complexity": int}. Model clients reply with JSON:
+{"answer": "...", "confidence": 0.0-1.0}.
+"""
 from __future__ import annotations
 
 import json
 from typing import Dict, List, Optional
 
-from interfaces import BudgetChecker, InMemoryBudget
+class InMemoryBudget:
+    def __init__(self, limit: float):
+        self.limit = limit
+        self._spent = 0.0
+    def can_afford(self, cost: float) -> bool:
+        return self._spent + cost <= self.limit
+    def charge(self, cost: float) -> None:
+        if not self.can_afford(cost):
+            raise RuntimeError("budget exceeded")
+        self._spent += cost
+    @property
+    def spent(self) -> float:
+        return self._spent
+
 
 
 class BudgetExceeded(Exception):
@@ -17,6 +37,12 @@ _COMPLEXITY_KEYWORDS = {
 
 
 def estimate_complexity(task: str) -> int:
+    """Deterministic complexity heuristic.
+    Requirements (exactly):
+        - base = number of whitespace-separated words
+        - +10 for each of these keywords present (case-insensitive):
+          "analyze", "compare", "architecture", "multi-step", "prove"
+    """
     words = task.lower().split()
     base = len(words)
     bonus = 0
@@ -34,15 +60,17 @@ class CostRouter:
         budget: float,
         confidence_exit: float = 0.8,
         *,
-        budget_checker: Optional[BudgetChecker] = None,
+        budget_checker=None,
         task_cost_ceiling: Optional[float] = None,
         fail_open: bool = False,
     ):
+        """models: name -> config. Must set up self.ledger: list of
+{"task": str, "model": str, "cost": float, "escalated": bool}."""
         self.models = models
         self.budget = budget
         self.confidence_exit = confidence_exit
         self.ledger: List[dict] = []
-        self._budget: BudgetChecker = budget_checker or InMemoryBudget(budget)
+        self._budget = budget_checker or InMemoryBudget(budget)
         self._spent = 0.0
         self._task_count = 0
         self._escalated_tasks = 0
@@ -50,6 +78,8 @@ class CostRouter:
         self.fail_open = fail_open
 
     def route(self, task: str) -> str:
+        """Return the name of the CHEAPEST model whose max_complexity >=
+estimate_complexity(task). No capable model -> the most capable one."""
         complexity = estimate_complexity(task)
         capable = [
             (name, cfg) for name, cfg in self.models.items()
@@ -69,6 +99,17 @@ class CostRouter:
         self._spent = self._budget.spent
 
     def run_task(self, task: str) -> dict:
+        """Execute one task.
+Requirements:
+    - Spending another call's cost must never push total spend past
+      the budget: raise BudgetExceeded BEFORE calling the model.
+    - Call the routed model. If its confidence >= confidence_exit,
+      return WITHOUT escalating (early exit).
+    - Otherwise escalate ONCE to the most capable (highest
+      max_complexity) model, budget permitting; mark escalated=True in
+      the ledger entries.
+    - Return {"answer": ..., "model": <final model>, "cost": <total
+      cost of this task>}."""
         self._task_count += 1
         model_name = self.route(task)
         cfg = self.models[model_name]
@@ -148,6 +189,8 @@ class CostRouter:
         return {"answer": answer, "model": final_model, "cost": task_cost}
 
     def analytics(self) -> dict:
+        """{"total_cost": float, "calls": int, "by_model": {name: cost},
+"escalation_rate": fraction of tasks that escalated (0.0 if none)}."""
         by_model: Dict[str, float] = {}
         for entry in self.ledger:
             by_model[entry["model"]] = by_model.get(entry["model"], 0.0) + entry["cost"]

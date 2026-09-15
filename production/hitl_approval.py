@@ -1,4 +1,10 @@
-"""Project 5 — HITL (production, stack-independent)."""
+"""Project 5 — Human-in-the-Loop Approval Agent.
+Uncertainty detection -> pause -> request human input -> resume with validated
+context, with a complete, ordered audit trail.
+
+The LLM replies with JSON: {"answer": "...", "confidence": 0.0-1.0,
+"action": "<name>"|null}.
+"""
 from __future__ import annotations
 
 import itertools
@@ -6,7 +12,16 @@ import json
 import time
 from typing import Callable, Dict, List, Optional, Set
 
-from interfaces import InMemoryTicketStore, TicketStore
+class InMemoryTicketStore:
+    def __init__(self):
+        self._data = {}
+    def save(self, ticket_id, data):
+        self._data[ticket_id] = dict(data)
+    def load(self, ticket_id):
+        return self._data.get(ticket_id)
+    def delete(self, ticket_id):
+        self._data.pop(ticket_id, None)
+
 
 
 class UnknownTicket(Exception):
@@ -26,9 +41,14 @@ class ApprovalAgent:
         *,
         ticket_ttl_seconds: Optional[float] = None,
         required_approvals: int = 1,
-        store: Optional[TicketStore] = None,
+        store=None,
         clock: Optional[Callable[[], float]] = None,
     ):
+        """Must set up:
+            - self.audit_log: append-only list of events, each
+              {"event": str, "detail": dict} — events in the order they happen.
+            - internal storage for paused tickets.
+        """
         self.llm = llm
         self.confidence_threshold = confidence_threshold
         self.protected_actions: Set[str] = set(protected_actions)
@@ -41,6 +61,18 @@ class ApprovalAgent:
         self._clock = clock or time.monotonic
 
     def handle(self, request: str) -> dict:
+        """Process a request.
+Requirements:
+    - Call the LLM once, parse its JSON.
+    - Log {"event": "request", ...} first, always.
+    - AUTO path: confidence >= threshold AND action not protected ->
+      log "completed" and return
+      {"status": "completed", "answer": ..., "ticket": None}.
+    - PAUSE path: low confidence OR protected action -> create a
+      ticket id, log "paused" with a "reason" of "low_confidence" or
+      "protected_action", store the pending answer/action, and return
+      {"status": "pending", "ticket": <id>, "reason": ...}.
+      The protected action MUST NOT be considered executed."""
         self.audit_log.append({"event": "request", "detail": {"request": request}})
         raw = self.llm.complete(request)
         data = json.loads(raw)
@@ -64,6 +96,15 @@ class ApprovalAgent:
         return {"status": "pending", "ticket": ticket_id, "reason": reason}
 
     def resume(self, ticket: str, approved: bool, human_note: str = "") -> dict:
+        """Resume a paused ticket with the human decision.
+Requirements:
+    - Unknown/already-resolved ticket -> raise UnknownTicket.
+    - Log "human_decision" (with approved + note), then:
+      approved -> log "completed", return {"status": "completed",
+      "answer": <pending answer>}.
+      rejected -> log "aborted", return {"status": "aborted",
+      "answer": None}.
+    - A ticket can be resumed exactly once."""
         pending = self._tickets.get(ticket) or self.store.load(ticket)
         if pending is None or pending.get("resolved"):
             raise UnknownTicket(f"Unknown or already resolved ticket: {ticket}")
@@ -105,6 +146,7 @@ class ApprovalAgent:
         }
 
     def audit_trail(self, ticket: str | None = None) -> list[dict]:
+        """Full audit log, or only events whose detail carries this ticket."""
         if ticket is None:
             return list(self.audit_log)
         return [e for e in self.audit_log if e.get("detail", {}).get("ticket") == ticket]

@@ -1,4 +1,11 @@
-"""Project 8 — Debate (production, stack-independent)."""
+"""Project 8 — Multi-Agent Debate System.
+N proposer agents answer independently, a critic scores each proposal,
+consensus picks a winner, and an aggregator synthesizes the final answer
+with a confidence value.
+
+Proposers reply with plain text. The critic replies with JSON:
+{"scores": [{"index": 0, "score": 0.0-1.0, "critique": "..."}, ...]}.
+"""
 from __future__ import annotations
 
 import json
@@ -18,6 +25,7 @@ class Debate:
         cost_ceiling: Optional[float] = None,
         cost_per_call: float = 1.0,
     ):
+        """proposers: LLM clients; critic and aggregator: LLM clients."""
         self.proposers = proposers
         self.critic = critic
         self.aggregator = aggregator
@@ -33,6 +41,21 @@ class Debate:
             raise RuntimeError("debate cost ceiling exceeded")
 
     def run(self, question: str) -> dict:
+        """Run one debate round.
+Requirements:
+    - Every proposer is asked the question independently (its prompt
+      must NOT contain other proposals).
+    - The critic is called once; its prompt must contain ALL proposals;
+      parse its scores.
+    - Winner = highest score; ties break on LOWER index (deterministic).
+    - confidence = winner_score - mean(other scores), clamped to
+      [0.0, 1.0]. Single proposer -> confidence = winner_score.
+    - The aggregator is called once with the question, the winning
+      proposal, and the critic's critique of it; its text response is
+      the final answer.
+    - Return {"answer": <aggregator text>, "winner_index": int,
+      "confidence": float, "proposals": [str, ...],
+      "scores": [float, ...]}."""
         proposals: List[str] = [""] * len(self.proposers)
         if self.parallel and len(self.proposers) > 1:
             with ThreadPoolExecutor(max_workers=len(self.proposers)) as pool:
