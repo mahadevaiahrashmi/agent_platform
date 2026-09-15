@@ -1,4 +1,4 @@
-# Agent Platform - Applied AI Engineering: FDE Hiring
+# Agent Platform - Applied AI Engineering
 
 Several product teams at Meridian are moving LLM-powered features from pilots into daily operations: extracting records from incoming documents, researching support questions, taking approved actions, and responding to background events. Each pilot works in isolation, but production has exposed the same failures repeatedly. Model responses arrive malformed, reasoning loops stall, tools are invoked without consistent access controls, conversations forget important context, and retries create duplicate work. Your platform team has been asked to turn those lessons into a shared Python Agent Platform.
 
@@ -25,6 +25,6 @@ Implement the methods that raise `NotImplementedError` in these ten candidate fi
 | Judge-guided refinement | `src/self_eval.py` |
 | Tracing, accounting, and loop detection | `src/observability.py` |
 
-The docstrings in those files are the exact implementation contracts. The matching pytest suites in `tests/` are the authoritative specification for exact behavior, including error strings, return shapes, call order, and timing. The modules are independent: complete as many as you can, with partial credit awarded per passing test across 64 tests.
+The docstrings in those files are the exact implementation contracts. The matching pytest suites in `tests/` are the authoritative specification for exact behavior, including error strings, return shapes, call order, and timing. The modules are independent:
 
-`src/fake_llm.py` provides a deterministic `FakeLLM`; do not modify it. No network access, provider account, or API key is needed. Run `pytest tests/` locally as you work.
+`fake_llm.py` provides a deterministic `FakeLLM`; do not modify it. Run `pytest tests/` locally as you work.
