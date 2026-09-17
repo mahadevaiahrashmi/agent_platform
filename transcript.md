@@ -4,7 +4,7 @@ I started with the clearest contracts—structured output, tool orchestration, a
 
 
 
-**One decision I’m proud of**
+# One decision I’m proud of
 
 I chose priority-based tool calls, with alphabetical order as the tie-breaker, so behavior is easy to explain, debug, and predict.
 
@@ -14,7 +14,7 @@ I rejected letting each caller pick their favorite tool. That sounds flexible, b
 
 ---
 
-**One thing that fought me**
+# One thing that fought me
 
 What was happening: tools finished in random order, so results came back shuffled even when the work was concurrent.
 
@@ -22,7 +22,7 @@ How I tackled it: allocate one slot per task up front and write each result into
 
 ---
 
-**Changes I planned but did not finish as hackerrank page got stuck and customer support couldnt fix it **
+# Changes I planned but did not finish as hackerrank page got stuck and customer support couldnt fix it
 
 These are improvements I designed and later finished offline. On the platform I stopped short so I would not break the 64 tests:
 
@@ -42,7 +42,7 @@ I did not lock in Redis, Postgres, or any other stack. That was out of scope and
 
 ---
 
-**What still breaks in production**
+# What still breaks in production
 
 Even with those changes, some things would not hold up under real enterprise traffic.
 
