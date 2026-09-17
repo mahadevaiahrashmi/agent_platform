@@ -98,6 +98,8 @@ Shared production primitives for LLM-powered document processing, research, oper
 ```bash
 pip install -r requirements.txt
 python -c "from src.structured_output import extract_structured; ..."
+PYTHONPATH=production python -m pytest tests/test_*.py -q
+PYTHONPATH=production python -m pytest tests/test_*.py -v //verbose
 ```
 
 All modules accept a deterministic `FakeLLM` (see `src/fake_llm.py`) so tests run fully offline.

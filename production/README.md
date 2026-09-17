@@ -19,8 +19,8 @@ Optional production features live **inside** the same module files (no extra sup
 
 Docstrings match the original problem statements.
 
-## Run graded tests
+## Run tests
 ```bash
 cd agent_platform
-PYTHONPATH=production python -m pytest test_*.py -q
+PYTHONPATH=production python -m pytest tests/test_*.py -q
 ```
